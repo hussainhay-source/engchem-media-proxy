@@ -29,6 +29,24 @@ const APP_SECRET = process.env.APP_SECRET || '';
 
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 20);
 
+// أنواع الملفات — عشان المتصفح يعرضها صح
+const MIME_TYPES = {
+  pdf: 'application/pdf',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  txt: 'text/plain',
+  zip: 'application/zip',
+};
+
 // ---------- تحقق من الإعدادات ----------
 if (!BOT_TOKEN || !CHAT_ID) {
   console.error('❌ ناقص BOT_TOKEN أو CHAT_ID — شوف ملف .env.example');
@@ -36,7 +54,16 @@ if (!BOT_TOKEN || !CHAT_ID) {
 }
 
 // ---------- الوسطيات ----------
-app.use(cors());
+// ⚠️ CORS مفتوح — ضروري لأن التطبيق يعرض الملفات من المتصفح
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'x-app-secret', 'Range'],
+    exposedHeaders: ['Content-Length', 'Content-Range', 'Content-Disposition'],
+    maxAge: 86400,
+  })
+);
 app.use(express.json());
 
 // نستقبل ملف واحد بحجم محدود
@@ -116,17 +143,62 @@ app.post('/upload', (req, res) => {
 // ============================================================
 //  تحميل ملف — يرجّع الملف من عندنا
 //  GET /files/:fileId
+//
+//  ⚠️ مهم للويب: نمرّر المحتوى عبر السيرفر بدل التحويل (redirect)
+//     لأن تلغرام ما يرسل CORS headers — و redirect يخلي المتصفح
+//     يروح لـ api.telegram.org فيرفض الطلب.
 // ============================================================
 app.get('/files/:fileId', async (req, res) => {
   try {
     const { fileId } = req.params;
 
-    // أولاً: نجيب رابط التحميل الحقيقي من تلغرام
+    // نجيب معلومات الملف من تلغرام
     const info = await getFileInfo(fileId);
     const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${info.file_path}`;
 
-    // ثانياً: نوجّه الطالب مباشرة (أسرع — ما نمرّر البيانات بم	server)
-    res.redirect(302, downloadUrl);
+    // نوع الملف من الامتداد
+    const ext = (info.file_path || '').split('.').pop().toLowerCase();
+    const mime = MIME_TYPES[ext] || 'application/octet-stream';
+
+    // تحقّق من الطلب: تحميل (attachment) ولا عرض (inline)
+    const asDownload = req.query.download === '1';
+
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader(
+      'Content-Disposition',
+      `${asDownload ? 'attachment' : 'inline'}; filename="${fileId}.${ext}"`
+    );
+
+    if (asDownload) {
+      // التحميل: نوجّه مباشرة (سريع وما يحتاج تمرير)
+      res.redirect(302, downloadUrl);
+      return;
+    }
+
+    // العرض: نمرّر المحتوى مع ترويسات CORS
+    const pass = https.get(
+      downloadUrl,
+      (upstream) => {
+        if (upstream.statusCode !== 200) {
+          res.status(upstream.statusCode || 502).end();
+          return;
+        }
+        const len = upstream.headers['content-length'];
+        if (len) res.setHeader('Content-Length', len);
+
+        upstream.pipe(res);
+      },
+      (err) => {
+        log('❌ فشل تمرير الملف:', err.message);
+        if (!res.headersSent) res.status(502).end();
+      }
+    );
+
+    pass.on('error', () => {
+      if (!res.headersSent) res.status(502).end();
+    });
   } catch (e) {
     log('❌ فشل التحميل:', e.message);
     res.status(404).json({ error: 'الملف مو موجود', detail: e.message });
