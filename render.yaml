@@ -19,4 +19,23 @@ services:
       - key: APP_SECRET
         sync: false
       - key: MAX_FILE_MB
-        value: "20"
+        value: "50"
+
+      # ---------- إشعارات FCM (مجانية) ----------
+      # انسخ محتوى ملف مفتاح الخدمة JSON كامل كسطر واحد.
+      # Firebase Console → Project Settings → Service Accounts
+      # → "Generate new private key" → انسخ الـ JSON كامل
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+
+      # اسم الموضوع اللي يشترك فيه كل الأجهزة
+      - key: FCM_TOPIC
+        value: "all_users"
+
+      # ---------- ملف الـ APK ----------
+      # Render: Shell → ارفع الملف:
+      #   cd /opt/render/project/src && mkdir -p public
+      #   base64 -d > public/EngChem.apk <<< '...'
+      # أو ارفعه كـ Disk / Release وحط المسار هنا
+      - key: APK_PATH
+        value: "./public/EngChem.apk"

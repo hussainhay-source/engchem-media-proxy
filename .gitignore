@@ -1,3 +1,9 @@
 node_modules/
 .env
 *.log
+
+# ملفات الـ APK كبيرة — ما ننشرها بالمستودع.
+# بدّلها يدوياً بـ Render أو ارفعها كملف Releases.
+# للتطوير المحلي:
+#   copy "%USERPROFILE%\Desktop\EngChem.apk" public\EngChem.apk
+public/*.apk

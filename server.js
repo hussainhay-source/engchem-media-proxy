@@ -17,6 +17,46 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
+// ============================================================
+//  إشعارات Firebase — اختيارية (تشتغل بس لو متغيرات البيئة موجودة)
+//
+//  ما في دوال سحابية (Cloud Functions) — وفّرنا اشتراك.
+//  الإدارة تتم من هذا السيرفر مباشرة.
+// ============================================================
+let getMessaging = null;
+let notificationsReady = false;
+
+(function initNotifications() {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) {
+    console.warn(
+      '⚠️  FIREBASE_SERVICE_ACCOUNT مو موجود — الإشعارات معطّلة'
+    );
+    return;
+  }
+
+  try {
+    // نبدّل \\n إلى أسطر حقيقية — بيطلعون من متغيرات البيئة
+    const json = raw.replace(/\\n/g, '\n');
+    const credentials =
+      process.env.FIREBASE_PROJECT_ID
+        ? JSON.parse(json)
+        : JSON.parse(json);
+
+    const admin = require('firebase-admin');
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert(credentials),
+      });
+    }
+    getMessaging = admin.messaging;
+    notificationsReady = true;
+    console.log('✅  إشعارات FCM مفعّلة — topic: ' + FCM_TOPIC);
+  } catch (e) {
+    console.error('❌ ما قدرنا نهيّئ الإشعارات:', e.message);
+  }
+})();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -27,7 +67,17 @@ const CHAT_ID = process.env.CHAT_ID;
 // مفتاح سرّي يميّز تطبيقنا عن أي حد ثاني (اختياري بس مستحسن)
 const APP_SECRET = process.env.APP_SECRET || '';
 
-const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 20);
+const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 50);
+
+// ---------- ملف الـ APK ----------
+// Firebase Hosting forbids .apk on the free plan —
+// so we serve it from here instead.
+const APK_PATH =
+  process.env.APK_PATH || path.join(__dirname, 'public', 'EngChem.apk');
+
+// ---------- إشعارات FCM ----------
+// Topic name everyone subscribes to.
+const FCM_TOPIC = process.env.FCM_TOPIC || 'all_users';
 
 // أنواع الملفات — عشان المتصفح يعرضها صح
 const MIME_TYPES = {
@@ -81,7 +131,108 @@ function log(...args) {
 //  فحص الحالة — Render يستخدمه للتأكد أن السيرفر حيّ
 // ============================================================
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'engchem-media-proxy', time: new Date() });
+  res.json({
+    ok: true,
+    service: 'engchem-media-proxy',
+    apk: fs.existsSync(APK_PATH),
+    notifications: notificationsReady,
+    time: new Date(),
+  });
+});
+
+// ============================================================
+//  تحميل تطبيق الموبايل (APK)
+//  GET /apk
+//
+//  Firebase Hosting ما يسمح برفع ملفات تنفيذية بالخطة المجانية،
+//  فنستضيفه هنا وننزّله مباشرة من المتصفح.
+// ============================================================
+app.get('/apk', (req, res) => {
+  if (!fs.existsSync(APK_PATH)) {
+    return res
+      .status(404)
+      .json({ error: 'ملف التطبيق غير موجود على السيرفر' });
+  }
+
+  const stat = fs.statSync(APK_PATH);
+  const fileName = 'EngChem.apk';
+
+  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+  res.setHeader('Content-Length', stat.size);
+  // attachment = المتصفح ينزّل الملف فوراً بدون ما يعرضه
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="${fileName}"`
+  );
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+
+  const stream = fs.createReadStream(APK_PATH);
+  stream.on('error', () => {
+    if (!res.headersSent) res.status(500).end();
+  });
+  stream.pipe(res);
+});
+
+// ============================================================
+//  إرسال إشعار لكل المستخدمين
+//  POST /notify   { title, body, url? }
+//
+//  ⚠️ مجاني 100% — ما يحتاج Firebase Functions ولا خطة مدفوعة.
+//     بيشتغل بـ firebase-admin من السيرفر هذا مباشرة.
+//     لازم متغير البيئة FIREBASE_SERVICE_ACCOUNT (JSON كامل).
+// ============================================================
+app.post('/notify', async (req, res) => {
+  if (APP_SECRET && req.headers['x-app-secret'] !== APP_SECRET) {
+    return res.status(401).json({ error: 'مفتاح التطبيق غير صحيح' });
+  }
+
+  if (!notificationsReady) {
+    return res.status(503).json({
+      error: 'خدمة الإشعارات غير مهيّأة',
+      hint: 'حط FIREBASE_SERVICE_ACCOUNT بمتغيرات البيئة على Render',
+    });
+  }
+
+  const { title, body, url } = req.body || {};
+
+  if (!title || !String(title).trim()) {
+    return res.status(400).json({ error: 'العنوان مطلوب' });
+  }
+
+  try {
+    const message = {
+      topic: FCM_TOPIC,
+      notification: {
+        title: String(title).slice(0, 120),
+        body: String(body || '').slice(0, 200),
+      },
+      webpush: {
+        notification: {
+          icon: '/icons/Icon-192.png',
+          badge: '/icons/Icon-192.png',
+        },
+        fcmOptions: {
+          link: url || 'https://engchem.web.app',
+        },
+      },
+      android: {
+        notification: {
+          icon: 'ic_launcher',
+          color: '#0D7C6E',
+        },
+      },
+    };
+
+    const id = await getMessaging().send(message);
+    log('🔔 إشعار مُرسل إلى', FCM_TOPIC, '→', id);
+
+    res.json({ ok: true, messageId: id, topic: FCM_TOPIC });
+  } catch (e) {
+    log('❌ فشل الإرسال:', e.message);
+    res.status(502).json({ error: 'فشل إرسال الإشعار', detail: e.message });
+  }
 });
 
 // ============================================================
@@ -313,12 +464,11 @@ function getBaseUrl(req) {
   return `${proto}://${req.headers.host}`;
 }
 
-// ============================================================
-//  تشغيل
-// ============================================================
 app.listen(PORT, '0.0.0.0', () => {
   log('🚀 EngChem Media Proxy شغّال');
   log(`   المنفذ : ${PORT}`);
   log(`   الحد الأقصى: ${MAX_FILE_MB} ميغابايت`);
   log(`   المفتاح السرّي: ${APP_SECRET ? 'مفعّل ✅' : 'غير مفعّل ⚠️'}`);
+  log(`   تطبيق الموبايل: ${fs.existsSync(APK_PATH) ? 'موجود ✅' : 'غير موجود ❌'}`);
+  log(`   الإشعارات: ${notificationsReady ? `مفعّلة ✅ (${FCM_TOPIC})` : 'معطّلة ⚠️'}`);
 });
