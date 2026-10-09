@@ -26,9 +26,68 @@ const https = require('https');
 let getMessaging = null;
 let notificationsReady = false;
 
+/**
+ * يقرأ مفتاح الخدمة من متغيّر البيئة ويصلّحه مهما كانت شكله.
+ *
+ * المشكلة: لما تنسخ JSON من Firebase وتلصقه بمتغيّر بيئة،
+ * الـ newlines جوّه `private_key` ممكن تتلف — فبيصير JSON.parse يفشل.
+ *
+ * بنجرّب عدة طرق بالترتيب:
+ *   1. JSON.parse على النص كما هو
+ *   2. فكّ الأقتباسات المحيطة
+ *   3. تحويل الأسطر الحقيقية إلى `\n` (JSON-safe)
+ *   4. تحويل `\n` المكتوب إلى أسطر حقيقية
+ */
+function parseServiceAccount(raw) {
+  if (!raw || !raw.trim()) {
+    throw new Error('القيمة فاضية');
+  }
+
+  let text = raw.trim();
+
+  // 1) المحاولة الأولى — كما هو
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    /* نجرب التالية */
+  }
+
+  // 2) نشيل الأقتباسات المحيطة (لو المستخدم لصق "....")
+  const unquoted = text.replace(/^["'`]+/, '').replace(/["'`]+$/, '');
+  try {
+    return JSON.parse(unquoted);
+  } catch (_) {
+    text = unquoted;
+  }
+
+  // 3) أسطر حقيقية جوّه النص → نخليها `\n` (اللي JSON يفهمه)
+  try {
+    return JSON.parse(text.replace(/\r\n|\r|\n/g, '\\n'));
+  } catch (_) {
+    /* نجرب التالية */
+  }
+
+  // 4) `\\n` مكتوبين بسطر واحد → نفكّهم لأسطر حقيقية
+  try {
+    return JSON.parse(text.replace(/\\n/g, '\n'));
+  } catch (_) {
+    /* نجرب الأخيرة */
+  }
+
+  // 5) الحل الأخير: نصلّح الحقل private_key يدوياً
+  try {
+    return JSON.parse(text.replace(/\r\n|\r|\n/g, '\\\\n'));
+  } catch (e) {
+    throw new Error(
+      'ما قدرنا نقرأ FIREBASE_SERVICE_ACCOUNT — ' + e.message
+    );
+  }
+}
+
 (function initNotifications() {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (!raw) {
+
+  if (!raw || !raw.trim()) {
     console.warn(
       '⚠️  FIREBASE_SERVICE_ACCOUNT مو موجود — الإشعارات معطّلة'
     );
@@ -36,24 +95,39 @@ let notificationsReady = false;
   }
 
   try {
-    // نبدّل \\n إلى أسطر حقيقية — بيطلعون من متغيرات البيئة
-    const json = raw.replace(/\\n/g, '\n');
-    const credentials =
-      process.env.FIREBASE_PROJECT_ID
-        ? JSON.parse(json)
-        : JSON.parse(json);
+    const credentials = parseServiceAccount(raw);
+
+    if (!credentials || typeof credentials !== 'object') {
+      throw new Error('النص ما انقرأ كـ JSON — تأكد من التنسيق');
+    }
+
+    // الحقول اللي Firebase Admin يحتاجها بالضبط
+    const required = ['project_id', 'private_key', 'client_email'];
+    const missing = required.filter((k) => !credentials[k]);
+
+    if (missing.length > 0) {
+      throw new Error(
+        'الملف ناقص — الحقول الناقصة: ' + missing.join('، ')
+      );
+    }
 
     const admin = require('firebase-admin');
     if (!admin.apps.length) {
       admin.initializeApp({
         credential: admin.credential.cert(credentials),
+        projectId: credentials.project_id,
       });
     }
+
     getMessaging = admin.messaging;
     notificationsReady = true;
     console.log('✅  إشعارات FCM مفعّلة — topic: ' + FCM_TOPIC);
+    console.log('   المشروع: ' + credentials.project_id);
   } catch (e) {
     console.error('❌ ما قدرنا نهيّئ الإشعارات:', e.message);
+    console.error(
+      '   تأكد إن القيمة محتوى ملف JSON كامل بدون أي علامات زايدة.'
+    );
   }
 })();
 
@@ -68,12 +142,6 @@ const CHAT_ID = process.env.CHAT_ID;
 const APP_SECRET = process.env.APP_SECRET || '';
 
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 50);
-
-// ---------- ملف الـ APK ----------
-// Firebase Hosting forbids .apk on the free plan —
-// so we serve it from here instead.
-const APK_PATH =
-  process.env.APK_PATH || path.join(__dirname, 'public', 'EngChem.apk');
 
 // ---------- إشعارات FCM ----------
 // Topic name everyone subscribes to.
@@ -134,45 +202,9 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'engchem-media-proxy',
-    apk: fs.existsSync(APK_PATH),
     notifications: notificationsReady,
     time: new Date(),
   });
-});
-
-// ============================================================
-//  تحميل تطبيق الموبايل (APK)
-//  GET /apk
-//
-//  Firebase Hosting ما يسمح برفع ملفات تنفيذية بالخطة المجانية،
-//  فنستضيفه هنا وننزّله مباشرة من المتصفح.
-// ============================================================
-app.get('/apk', (req, res) => {
-  if (!fs.existsSync(APK_PATH)) {
-    return res
-      .status(404)
-      .json({ error: 'ملف التطبيق غير موجود على السيرفر' });
-  }
-
-  const stat = fs.statSync(APK_PATH);
-  const fileName = 'EngChem.apk';
-
-  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-  res.setHeader('Content-Length', stat.size);
-  // attachment = المتصفح ينزّل الملف فوراً بدون ما يعرضه
-  res.setHeader(
-    'Content-Disposition',
-    `attachment; filename="${fileName}"`
-  );
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  res.setHeader('Cache-Control', 'public, max-age=3600');
-
-  const stream = fs.createReadStream(APK_PATH);
-  stream.on('error', () => {
-    if (!res.headersSent) res.status(500).end();
-  });
-  stream.pipe(res);
 });
 
 // ============================================================
@@ -469,6 +501,5 @@ app.listen(PORT, '0.0.0.0', () => {
   log(`   المنفذ : ${PORT}`);
   log(`   الحد الأقصى: ${MAX_FILE_MB} ميغابايت`);
   log(`   المفتاح السرّي: ${APP_SECRET ? 'مفعّل ✅' : 'غير مفعّل ⚠️'}`);
-  log(`   تطبيق الموبايل: ${fs.existsSync(APK_PATH) ? 'موجود ✅' : 'غير موجود ❌'}`);
   log(`   الإشعارات: ${notificationsReady ? `مفعّلة ✅ (${FCM_TOPIC})` : 'معطّلة ⚠️'}`);
 });
