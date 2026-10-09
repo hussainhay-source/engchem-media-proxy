@@ -1,0 +1,22 @@
+# ============================================================
+#  إعداد Render — انسخ هالملف لمجلد server/  وسوّي ريبو على GitHub
+# ============================================================
+
+services:
+  - type: web
+    name: engchem-media-proxy
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: APP_SECRET
+        sync: false
+      - key: MAX_FILE_MB
+        value: "20"
